@@ -1,6 +1,7 @@
 import pyhdfe
 import re
 import pdb
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -58,6 +59,20 @@ class Fixest:
             raise ValueError("iwls_maxiter must be larger than 0")
 
         self._data = data.copy()
+
+        # turn all datetypes into factors
+        for col in self._data.columns:
+            if pd.api.types.is_datetime64_any_dtype(self._data[col]):
+                min_time = self._data[col].min()
+                self._data[col] = (self._data[col] - min_time).dt.total_seconds().astype("int64")
+                warnings.warn(
+                    f"""Column {col} was converted to a time difference as it was a datetime.
+                    The time difference is relative to the minimum value of the column,
+                    which is {min_time}, and measured in seconds (nanosecond differences are
+                    ignored).
+                    """
+                )
+
         # reindex: else, potential errors when pd.DataFrame.dropna()
         # -> drops indices, but formulaic model_matrix starts from 0:N...
         self._data.index = range(self._data.shape[0])
