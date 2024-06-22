@@ -60,11 +60,11 @@ class Fepois(Feols):
         self,
         Y: np.ndarray,
         X: np.ndarray,
-        fe: Union[np.ndarray, None],
-        weights: np.ndarray,
-        coefnames: list[str],
-        drop_singletons: bool,
-        collin_tol: float,
+        fe: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
+        coefnames: Optional[list[str]] = None,
+        drop_singletons: bool = False,
+        collin_tol: float = 1e-08,
         maxiter: int = 25,
         tol: float = 1e-08,
         fixef_tol: float = 1e-08,
@@ -83,6 +83,8 @@ class Fepois(Feols):
 
         # input checks
         _fepois_input_checks(fe, drop_singletons, tol, maxiter)
+        if fe is not None:
+            fe = fe.astype(np.int64)
 
         self.fe = fe
         self.maxiter = maxiter
@@ -113,7 +115,7 @@ class Fepois(Feols):
         self.deviance = None
         self._Xbeta = np.array([])
 
-    def get_fit(self) -> None:
+    def fit(self) -> None:
         """
         Fit a Poisson Regression Model via Iterated Weighted Least Squares (IWLS).
 

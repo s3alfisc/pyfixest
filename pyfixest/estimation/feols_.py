@@ -12,6 +12,7 @@ from scipy.sparse.linalg import spsolve
 from scipy.stats import f, norm, t
 
 from pyfixest.errors import VcovTypeNotSupportedError
+from pyfixest.estimation.demean_ import demean
 from pyfixest.estimation.ritest import (
     _decode_resampvar,
     _get_ritest_pvalue,
@@ -32,7 +33,7 @@ from pyfixest.utils.dev_utils import (
     _polars_to_pandas,
     _select_order_coefs,
 )
-from pyfixest.utils.utils import get_ssc, simultaneous_crit_val
+from pyfixest.utils.utils import get_ssc, simultaneous_crit_val, ssc
 
 
 class Feols:
@@ -107,13 +108,13 @@ class Feols:
     _ssc_dict : dict
         dictionary for sum of squares and cross products matrices.
     _tZX : np.ndarray
-        Transpose of Z multiplied by X, set in get_fit().
+        Transpose of Z multiplied by X, set in fit().
     _tXZ : np.ndarray
-        Transpose of X multiplied by Z, set in get_fit().
+        Transpose of X multiplied by Z, set in fit().
     _tZy : np.ndarray
-        Transpose of Z multiplied by Y, set in get_fit().
+        Transpose of Z multiplied by Y, set in fit().
     _tZZinv : np.ndarray
-        Inverse of the transpose of Z multiplied by Z, set in get_fit().
+        Inverse of the transpose of Z multiplied by Z, set in fit().
     _beta_hat : np.ndarray
         Estimated regression coefficients.
     _Y_hat_link : np.ndarray
@@ -173,49 +174,34 @@ class Feols:
         self,
         Y: np.ndarray,
         X: np.ndarray,
-        weights: np.ndarray,
-        collin_tol: float,
-        coefnames: list[str],
-        weights_name: Optional[str],
-        weights_type: Optional[str],
+        fe: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
+        collin_tol: Optional[float] = 1e-08,
+        coefnames: Optional[list[str]] = None,
+        weights_name: Optional[str] = None,
+        weights_type: Optional[str] = None,
+        ssc: dict[str, Union[str, bool]] = ssc(),
     ) -> None:
         self._method = "feols"
         self._is_iv = False
 
-        self._weights = weights
+        self._coefnames = (
+            [str(i) for i in range(X.shape[1])] if coefnames is None else coefnames
+        )
+        self._has_fixef = True if fe is not None else True
+
+        self._X = X
+        self._Y = Y
+        self._fe = fe
+        self._collin_tol = collin_tol
+
+        self._weights = (
+            weights.flatten() if weights is not None else np.ones(Y.shape[0])
+        )
         self._weights_name = weights_name
         self._weights_type = weights_type
-        self._has_weights = False
-        if weights_name is not None:
-            self._has_weights = True
 
-        if self._has_weights:
-            w = np.sqrt(weights)
-            self._Y = Y * w
-            self._X = X * w
-        else:
-            self._Y = Y
-            self._X = X
-
-        self.get_nobs()
-
-        _feols_input_checks(Y, X, weights)
-
-        if self._X.shape[1] == 0:
-            self._X_is_empty = True
-        else:
-            self._X_is_empty = False
-            self._collin_tol = collin_tol
-            (
-                self._X,
-                self._coefnames,
-                self._collin_vars,
-                self._collin_index,
-            ) = _drop_multicollinear_variables(self._X, coefnames, self._collin_tol)
-
-        self._Z = self._X
-
-        _, self._k = self._X.shape
+        self._has_weights = weights is None
 
         self._support_crv3_inference = True
         if self._weights_name is not None:
@@ -229,13 +215,12 @@ class Feols:
         # not really optimal code change later
         self._data = pd.DataFrame()
         self._fml = ""
-        self._has_fixef = False
         self._fixef = ""
         # self._coefnames = None
         self._icovars = None
-        self._ssc_dict: dict[str, Union[str, bool]] = {}
+        self._ssc_dict: dict[str, Union[str, bool]] = ssc
 
-        # set in get_fit()
+        # set in fit()
         self._tZX = np.array([])
         # self._tZXinv = None
         self._tXZ = np.array([])
@@ -260,7 +245,7 @@ class Feols:
         self.na_index = np.array([])  # initiated outside of the class
         self.n_separation_na = 0
 
-        # set in get_inference()
+        # set in inference()
         self._se = np.array([])
         self._tstat = np.array([])
         self._pvalue = np.array([])
@@ -273,7 +258,7 @@ class Feols:
         self._fixef_dict: dict[str, dict[str, float]] = {}
         self._sumFE = None
 
-        # set in get_performance()
+        # set in performance()
         self._rmse = np.nan
         self._r2 = np.nan
         self._r2_within = np.nan
@@ -295,7 +280,44 @@ class Feols:
         self.summary = functools.partial(_tmp, models=[self])
         self.summary.__doc__ = _tmp.__doc__
 
-    def get_fit(self) -> None:
+    def _prepare_fit(self):
+        """Prepare fitting, including demeaning."""
+        if self._fe is not None:
+            self._fe = self._fe.astype(np.int64)
+            YX = np.concatenate([self._Y, self._X], axis=1)
+            YX, _ = demean(YX, self._fe, self._weights)
+            self._Y = YX[:, 0]
+            self._X = YX[:, 1:]
+            if self._Y.ndim == 1:
+                self._Y = self._Y.reshape((-1, 1))
+            if self._X.ndim == 1:
+                self._X = self._X.reshape((-1, 1))
+
+        if self._weights is not None:
+            w = np.sqrt(self._weights).reshape((-1, 1))
+            self._Y = self._Y * w
+            self._X = self._X * w
+
+        _feols_input_checks(self._Y, self._X, self._weights.reshape((-1, 1)))
+
+        if self._X.shape[1] == 0:
+            self._X_is_empty = True
+        else:
+            self._X_is_empty = False
+            (
+                self._X,
+                self._coefnames,
+                self._collin_vars,
+                self._collin_index,
+            ) = _drop_multicollinear_variables(
+                self._X, self._coefnames, self._collin_tol
+            )
+
+        self._Z = self._X
+        self._N, self._k = self._X.shape
+        self._fe = None  # don't store it, just eats RAM
+
+    def fit(self) -> None:
         """
         Fit an OLS model.
 
@@ -303,6 +325,8 @@ class Feols:
         -------
         None
         """
+        self._prepare_fit()
+
         _X = self._X
         _Y = self._Y
         _Z = self._Z
@@ -310,11 +334,7 @@ class Feols:
         self._tZX = _Z.T @ _X
         self._tZy = _Z.T @ _Y
 
-        # self._tZXinv = np.linalg.inv(self._tZX)
         self._beta_hat = np.linalg.solve(self._tZX, self._tZy).flatten()
-        # self._beta_hat, _, _, _ = lstsq(self._tZX, self._tZy, lapack_driver='gelsy')
-
-        # self._beta_hat = (self._tZXinv @ self._tZy).flatten()
 
         self._Y_hat_link = self._X @ self._beta_hat
         self._u_hat = self._Y.flatten() - self._Y_hat_link.flatten()
@@ -476,7 +496,7 @@ class Feols:
                         )
 
         # update p-value, t-stat, standard error, confint
-        self.get_inference()
+        self.inference()
 
         return self
 
@@ -661,7 +681,7 @@ class Feols:
 
         return _vcov
 
-    def get_inference(self, alpha: float = 0.95) -> None:
+    def inference(self, alpha: float = 0.95) -> None:
         """
         Compute standard errors, t-statistics, and p-values for the regression model.
 
@@ -982,8 +1002,11 @@ class Feols:
             fml_dummies = f"{fml_linear} + {fixef_fml}"
 
             # make this sparse once wildboottest allows it
-            _, _X = Formula(fml_dummies).get_model_matrix(_data, output="numpy")
-            _xnames = _X.model_spec.column_names
+            _, _X_full = Formula(fml_dummies).get_model_matrix(_data, output="numpy")
+            _xnames = _X_full.model_spec.column_names
+
+        else:
+            _X_full = _X
 
         # later: allow r <> 0 and custom R
         R = np.zeros(len(_xnames))
@@ -994,7 +1017,7 @@ class Feols:
         if run_heteroskedastic:
             inference = "HC"
 
-            boot = WildboottestHC(X=_X, Y=_Y, R=R, r=r, B=reps, seed=seed)
+            boot = WildboottestHC(X=_X_full, Y=_Y, R=R, r=r, B=reps, seed=seed)
             boot.get_adjustments(bootstrap_type=bootstrap_type)
             boot.get_uhat(impose_null=impose_null)
             boot.get_tboot(weights_type=weights_type)
@@ -1008,7 +1031,7 @@ class Feols:
             cluster_array = _data[cluster_list[0]].to_numpy().flatten()
 
             boot = WildboottestCL(
-                X=_X,
+                X=_X_full,
                 Y=_Y,
                 cluster=cluster_array,
                 R=R,
@@ -1412,7 +1435,7 @@ class Feols:
 
         return y_hat.flatten()
 
-    def get_nobs(self):
+    def nobs(self):
         """
         Fetch the number of observations used in fitting the regression model.
 
@@ -1426,7 +1449,7 @@ class Feols:
         elif self._weights_type == "fweights":
             self._N = np.sum(self._weights)
 
-    def get_performance(self) -> None:
+    def performance(self) -> None:
         """
         Get Goodness-of-Fit measures.
 
@@ -1914,7 +1937,7 @@ class Feols:
         )
 
 
-def _feols_input_checks(Y: np.ndarray, X: np.ndarray, weights: np.ndarray):
+def _feols_input_checks(Y: np.ndarray, X: np.ndarray, weights: Optional[np.ndarray]):
     """
     Perform basic checks on the input matrices Y and X for the FEOLS.
 
@@ -1935,14 +1958,14 @@ def _feols_input_checks(Y: np.ndarray, X: np.ndarray, weights: np.ndarray):
         raise TypeError("Y must be a numpy array.")
     if not isinstance(X, (np.ndarray)):
         raise TypeError("X must be a numpy array.")
-    if not isinstance(weights, (np.ndarray)):
+    if weights is not None and not isinstance(weights, (np.ndarray)):
         raise TypeError("weights must be a numpy array.")
 
     if Y.ndim != 2:
         raise ValueError("Y must be a 2D array")
     if X.ndim != 2:
         raise ValueError("X must be a 2D array")
-    if weights.ndim != 2:
+    if weights is not None and weights.ndim != 2:
         raise ValueError("weights must be a 2D array")
 
 
@@ -1982,7 +2005,7 @@ def _get_vcov_type(vcov: str, fval: str):
 
 
 def _drop_multicollinear_variables(
-    X: np.ndarray, names: list[str], collin_tol: float
+    X: np.ndarray, names: list[str], collin_tol: Optional[float] = 1e-08
 ) -> tuple[np.ndarray, list[str], list[str], list[int]]:
     """
     Check for multicollinearity in the design matrices X and Z.
@@ -2047,7 +2070,7 @@ def _drop_multicollinear_variables(
 
 
 def _find_collinear_variables(
-    X: np.ndarray, tol: float = 1e-10
+    X: np.ndarray, tol: Optional[float] = 1e-10
 ) -> tuple[np.ndarray, int, bool]:
     """
     Detect multicollinear variables.
